@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><AllowUnsafeBlocks>true</AllowUnsafeBlocks></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../Tedd.DotNetPod/src/Tedd.DotNetPod/Tedd.DotNetPod.csproj"/>
+    <ProjectReference Include="../../../Tedd.HostNetMesh/src/Tedd.HostMesh/Tedd.HostMesh.csproj"/>
+    <ProjectReference Include="../../../Tedd.TDFS/src/Tedd.Tdfs.Client/Tedd.Tdfs.Client.csproj"/>
+  </ItemGroup>
+</Project>
