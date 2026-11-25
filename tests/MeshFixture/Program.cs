@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Tedd.HostMesh;
 
 var client = File.Exists("/mesh/key") ? new LocalMeshClient("/mesh/agent.sock", Convert.FromBase64String(File.ReadAllText("/mesh/key").Trim())) : null;
@@ -7,6 +8,18 @@ var streamServer = listener == null ? Task.CompletedTask : ServeStreams();
 Directory.CreateDirectory("/data/files");
 var count = File.Exists("/data/files/starts") ? int.Parse(File.ReadAllText("/data/files/starts")) : 0;
 File.WriteAllText("/data/files/starts", (count + 1).ToString());
+using var shutdown = PosixSignalRegistration.Create(PosixSignal.SIGTERM, _ =>
+{
+    if (File.Exists("/data/files/checkpoint-on-stop"))
+        File.WriteAllText("/app/logs/shutdown-checkpoint", (count + 1).ToString());
+});
+if (Directory.Exists("/app/logs") && Directory.Exists("/data/logs"))
+{
+    var marker = (count + 1) + "\n";
+    File.AppendAllText("/app/logs/starts.log", marker);
+    if (!File.ReadAllText("/data/logs/starts.log").EndsWith(marker, StringComparison.Ordinal))
+        throw new IOException("The mapped log directory does not match the ordinal's data.");
+}
 File.Delete("/data/files/stall");
 var heartbeat = Heartbeat();
 File.WriteAllText("/tmp/ready", "");

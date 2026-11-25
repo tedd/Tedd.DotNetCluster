@@ -9,10 +9,12 @@ if (args.Length == 0 || args.Length != (args[0] switch
     "worker" or "status" or "gateway" => 2,
     "apply" or "delete" => 3,
     "publish" => 4,
+    "github-latest" when args.Length is 4 or 5 => args.Length,
     _ => -1
 }))
 {
     Console.Error.WriteLine("dotnetmesh <worker|gateway|status|apply|delete|publish> cluster.json [deployment.json|name] [published-directory]");
+    Console.Error.WriteLine("dotnetmesh github-latest cluster.json deployment.json OWNER/REPO [asset.zip]");
     return 2;
 }
 using var shutdown = new CancellationTokenSource();
@@ -47,13 +49,22 @@ try
             break;
         case "publish":
         case "apply":
+        case "github-latest":
             var d = JsonSerializer.Deserialize<Deployment>(await File.ReadAllTextAsync(args[2], ct)) ?? throw new InvalidDataException("Empty deployment.");
+            if (args[0] == "github-latest")
+            {
+                using var http = new HttpClient();
+                var deployed = await GitHubReleases.DeployLatestAsync(http, volume, d, args[3], args.ElementAtOrDefault(4),
+                    Environment.GetEnvironmentVariable("GITHUB_TOKEN"), ct);
+                Console.WriteLine(deployed.Snapshot);
+                break;
+            }
             d.Validate();
             if (args[0] == "publish") await ReleasePublisher.PublishAsync(volume, d, args[3], ct);
             else
             {
                 await using var revision = await volume.Snapshots.OpenAsync(d.Snapshot, ct);
-                if (!await revision.Files.ExistsAsync("/apps/" + d.Name + "/" + d.EntryPoint, ct)) throw new FileNotFoundException(d.EntryPoint);
+                await d.ValidateApplicationAsync(revision.Files, revision.Directories, ct);
                 await store.ChangeAsync(s => s.Deployments[d.Name] = d, ct);
             }
             break;

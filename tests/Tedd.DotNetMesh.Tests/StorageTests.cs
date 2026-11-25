@@ -37,7 +37,9 @@ public class StorageTests
             finally { await leader.RestartAsync(); await cluster.WaitForStableAsync(ct: ct); }
         }, TestContext.Current.CancellationToken);
 
-    public static bool Live => OperatingSystem.IsLinux() && Environment.GetEnvironmentVariable("MESH_TEST_DIRECTORY") != null;
+    public static bool Live => OperatingSystem.IsLinux() && !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MESH_TEST_DIRECTORY"));
+    public static bool ContainerAvailable => Live && new[] { "POD_TEST_SOCKET", "POD_TEST_IMAGE", "MESH_TEST_FIXTURE" }
+        .All(name => !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(name)));
 
     [Fact(SkipUnless = nameof(Live), Skip = "Requires the Linux FUSE3 bridge.")]
     public Task MountedRandomWritesRenamesAndRevocationUseTheReplicatedVolume() =>
@@ -72,7 +74,7 @@ public class StorageTests
             Assert.False(await volume.Files.ExistsAsync("/data/slot/hello", ct));
         }, TestContext.Current.CancellationToken);
 
-    [Fact(SkipUnless = nameof(Live), Skip = "Requires a Linux FUSE mount, a disposable container engine and the published mesh fixture.")]
+    [Fact(SkipUnless = nameof(ContainerAvailable), Skip = "Requires a Linux FUSE mount, a disposable container engine and the published mesh fixture.")]
     public Task ContainerExecutesSnapshotWritesReplicatedDataAndUsesItsMeshAddress() =>
         ClusterTest.RunAsync(Options, async cluster =>
         {
@@ -87,7 +89,10 @@ public class StorageTests
             await volume.Directories.CreateDirectoryAsync("/apps/echo", ct);
             foreach (var file in Directory.EnumerateFiles(fixture).Where(f => f.EndsWith(".dll") || f.EndsWith(".json")))
                 await volume.Files.WriteAllBytesAsync("/apps/echo/" + Path.GetFileName(file), await File.ReadAllBytesAsync(file, ct), ct);
+            await volume.Directories.CreateDirectoryAsync("/apps/echo/logs", ct);
             await volume.Snapshots.CreateAsync("v1", ct: ct);
+            await volume.Files.WriteAllTextAsync("/apps/echo/version", "2", ct: ct);
+            await volume.Snapshots.CreateAsync("v2", ct: ct);
             // A running revision must read the snapshot even after the publisher updates the live tree.
             await volume.Files.WriteAllBytesAsync("/apps/echo/MeshFixture.dll", new byte[] { 1, 2, 3 }, ct);
 
@@ -111,7 +116,8 @@ public class StorageTests
             using var caller = agent.Register("tester").BindDatagram(4051, allowed);
 
             var d = new Deployment("echo", "v1", Environment.GetEnvironmentVariable("POD_TEST_IMAGE")!,
-                "MeshFixture.dll", Mesh: true, ReadinessFile: "ready", LivenessFile: "alive", LivenessTimeoutSeconds: 6);
+                "MeshFixture.dll", Mesh: true, ReadinessFile: "ready", LivenessFile: "alive", LivenessTimeoutSeconds: 6,
+                PersistentDirectories: [new("logs", "/app/logs")]);
             var options = new WorkerOptions("test-" + Guid.NewGuid().ToString("N")[..8], "zone", root + "/worker", 512, 2000,
                 new() { ["echo-0"] = binding }, Environment.GetEnvironmentVariable("POD_TEST_SOCKET")!);
             using var host = PodHost.Open(options.Node, options.EngineSocket);
@@ -122,6 +128,7 @@ public class StorageTests
                 await worker.RecoverAsync(ct);
                 await AwaitReady(worker, host, ct);
                 Assert.Equal("1", await read.Files.ReadAllTextAsync("/data/echo/0/files/starts", ct: ct));
+                Assert.Equal("1\n", await read.Files.ReadAllTextAsync("/data/echo/0/logs/starts.log", ct: ct));
                 Assert.True(caller.SendTo(new(appIp, 4050), new byte[] { 3, 1, 4 }));
                 using var replyTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 replyTimeout.CancelAfter(TimeSpan.FromSeconds(10));
@@ -182,6 +189,12 @@ public class StorageTests
                 await restarted.RecoverAsync(ct);
                 await AwaitReady(restarted, host, ct);
                 Assert.Equal("3", await read.Files.ReadAllTextAsync("/data/echo/0/files/starts", ct: ct));
+                await volume.Files.WriteAllTextAsync("/data/echo/0/files/checkpoint-on-stop", "", ct: ct);
+                await store.ChangeAsync(s => s.Deployments[d.Name] = d with { Snapshot = "v2" }, ct);
+                await AwaitReady(restarted, host, ct);
+                Assert.Equal("3", await read.Files.ReadAllTextAsync("/data/echo/0/logs/shutdown-checkpoint", ct: ct));
+                await volume.Files.DeleteAsync("/data/echo/0/files/checkpoint-on-stop", ct);
+                Assert.Equal("1\n2\n3\n4\n", await read.Files.ReadAllTextAsync("/data/echo/0/logs/starts.log", ct: ct));
                 await store.ChangeAsync(s => s.Deployments.Clear(), ct);
                 await restarted.TickAsync(ct);
                 Assert.Empty(await host.ListAsync(ct));

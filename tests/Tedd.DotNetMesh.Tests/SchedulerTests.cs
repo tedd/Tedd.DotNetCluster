@@ -149,6 +149,85 @@ public class SchedulerTests
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReplacementWaitsForTheExactOutgoingContainerToStop(bool move)
+    {
+        var state = Start(("a", "east"), ("b", "west"));
+        var old = App with { Mesh = true, Replicas = 1 };
+        var next = old with { Snapshot = "next", Image = "sha256:" + new string('b', 64) };
+        var key = old.Slot(0);
+        state.Deployments[old.Name] = old;
+        foreach (var node in state.Nodes.Values.ToArray())
+            state.Nodes[node.Node] = node with { SupportsStopHandoff = true, Images = node.Node == "a" && move ? [old.Image] : [old.Image, next.Image],
+                Bindings = [key], Addresses = new() { [key] = "10.0.0.1" } };
+        Scheduler.Reconcile(state, Now);
+        var original = state.Slots[key];
+        MarkReady(state);
+        state.Deployments[old.Name] = next;
+        Scheduler.Reconcile(state, Now);
+        Assert.Equal(original with { Stopping = true }, state.Slots[key]);
+        Assert.Empty(ServiceGateway.Resolve(state, new(81, old.Name, 8080), Now));
+        state.Nodes["a"].Ready.Clear();
+        Scheduler.Reconcile(state, Now);
+        Scheduler.ConfirmStopped(state, key, "b", original.Generation, Now);
+        Scheduler.ConfirmStopped(state, key, "a", "stale", Now);
+        Assert.Equal(original.Generation, state.Slots[key].Generation);
+        Scheduler.ConfirmStopped(state, key, "a", original.Generation, Now);
+        var replaced = state.Slots[key];
+        Assert.Equal(move ? "b" : "a", replaced.Node);
+        Assert.Equal(next, replaced.Release);
+        Assert.False(replaced.Stopping);
+        Assert.NotEqual(original.Generation, replaced.Generation);
+        Scheduler.ConfirmStopped(state, key, "a", original.Generation, Now);
+        Assert.Equal(replaced, state.Slots[key]);
+    }
+
+    [Fact]
+    public void SourceExpiryCompletesAStalledGracefulDrain()
+    {
+        var state = Start(("a", "east"), ("b", "west"));
+        state.Deployments[App.Name] = App with { Replicas = 1 };
+        foreach (var node in state.Nodes.Values.ToArray()) state.Nodes[node.Node] = node with { SupportsStopHandoff = true };
+        Scheduler.Reconcile(state, Now);
+        state.Nodes["a"] = state.Nodes["a"] with { Drain = true };
+        Scheduler.Reconcile(state, Now);
+        Assert.True(Assert.Single(state.Slots).Value.Stopping);
+        state.Nodes["b"] = state.Nodes["b"] with { Seen = Now + Scheduler.FailureTimeout };
+        Scheduler.Reconcile(state, Now + Scheduler.FailureTimeout);
+        var replacement = Assert.Single(state.Slots).Value;
+        Assert.Equal("b", replacement.Node);
+        Assert.False(replacement.Stopping);
+    }
+
+    [Fact]
+    public void AddingCapacityMovesOneReplicaAfterItsSourceAcknowledges()
+    {
+        var state = Start(("a", "east"));
+        state.Nodes["a"] = state.Nodes["a"] with { SupportsStopHandoff = true };
+        Scheduler.Reconcile(state, Now);
+        MarkReady(state);
+        state.Nodes["b"] = state.Nodes["a"] with { Node = "b", Zone = "west", Ready = new() };
+        Scheduler.Reconcile(state, Now);
+        var stopping = Assert.Single(state.Slots, p => p.Value.Stopping);
+        Scheduler.Reconcile(state, Now);
+        Assert.All(state.Slots.Values, p => Assert.Equal("a", p.Node));
+        Scheduler.ConfirmStopped(state, stopping.Key, "a", stopping.Value.Generation, Now);
+        Assert.Equal("b", state.Slots[stopping.Key].Node);
+        state.Deployments[App.Name] = App with { Snapshot = "updated" };
+        MarkReady(state);
+        Scheduler.Reconcile(state, Now);
+        stopping = Assert.Single(state.Slots, p => p.Value.Stopping);
+        Scheduler.ConfirmStopped(state, stopping.Key, stopping.Value.Node, stopping.Value.Generation, Now);
+        Scheduler.Reconcile(state, Now);
+        Assert.DoesNotContain(state.Slots.Values, p => p.Stopping);
+        Assert.Single(state.Slots.Values, p => p.Release.Snapshot == "updated");
+        MarkReady(state);
+        Scheduler.Reconcile(state, Now);
+        Assert.Single(state.Slots.Values, p => p.Stopping);
+    }
+
     [Fact]
     public void ScalingDoesNotRestartRetainedSlotsAndDeletionClearsAssignments()
     {
@@ -162,6 +241,39 @@ public class SchedulerTests
         Scheduler.Reconcile(s, Now);
         Assert.Empty(s.Slots);
     }
+
+    [Fact]
+    public void EquivalentPersistentDirectoriesSurviveReloadAndChangedMappingsReplaceThePod()
+    {
+        var state = Start(("node", "zone"));
+        var deployment = App with { Replicas = 1, PersistentDirectories = [new("logs", "/app/logs"), new("state/index", "/index")] };
+        deployment.Validate();
+        state.Deployments[deployment.Name] = deployment;
+        Scheduler.Reconcile(state, Now);
+        var original = Assert.Single(state.Slots).Value;
+        MarkReady(state);
+        state = System.Text.Json.JsonSerializer.Deserialize<ClusterState>(System.Text.Json.JsonSerializer.Serialize(state))!;
+        state.Deployments[deployment.Name] = deployment with { PersistentDirectories = [new("state/index", "/index"), new("logs", "/app/logs")] };
+        Scheduler.Reconcile(state, Now);
+        Assert.Equal(original.Generation, Assert.Single(state.Slots).Value.Generation);
+        state.Deployments[deployment.Name] = deployment with { PersistentDirectories = [new("logs", "/logs")] };
+        Scheduler.Reconcile(state, Now);
+        Assert.NotEqual(original.Generation, Assert.Single(state.Slots).Value.Generation);
+    }
+
+    [Theory]
+    [InlineData("", "/logs")]
+    [InlineData("../other", "/logs")]
+    [InlineData("data:stream", "/logs")]
+    [InlineData("/etc", "/logs")]
+    [InlineData("logs", "/data")]
+    [InlineData("logs", "logs")]
+    public void RejectsUnscopedPersistentDirectories(string source, string target) =>
+        Assert.Throws<ArgumentException>(() => (App with { PersistentDirectories = [new(source, target)] }).Validate());
+
+    [Fact]
+    public void RejectsOverlappingPersistentTargets() => Assert.Throws<ArgumentException>(() =>
+        (App with { PersistentDirectories = [new("one", "/logs"), new("two", "/logs/archive")] }).Validate());
 
     [Theory]
     [InlineData("/../x")]

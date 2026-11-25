@@ -35,7 +35,7 @@ public sealed class ServiceGateway
         if (!state.Deployments.TryGetValue(route.Deployment, out var desired)) return [];
         var endpoints = new List<IPEndPoint>();
         foreach (var (key, slot) in state.Slots)
-            if (slot.Release.Name == desired.Name && slot.Ordinal < desired.Replicas && slot.Release.Mesh &&
+            if (!slot.Stopping && slot.Release.Name == desired.Name && slot.Ordinal < desired.Replicas && slot.Release.Mesh &&
                 state.Nodes.TryGetValue(slot.Node, out var n) && !n.Drain && now - n.Seen < Scheduler.FailureTimeout &&
                 n.Ready.GetValueOrDefault(key) == slot.Generation && IPAddress.TryParse(n.Addresses?.GetValueOrDefault(key), out var ip))
                 endpoints.Add(new(ip, route.TargetPort));

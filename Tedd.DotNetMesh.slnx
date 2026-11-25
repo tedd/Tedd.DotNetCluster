@@ -1,1 +1,5 @@
-<Solution><Project Path="src/Tedd.DotNetMesh/Tedd.DotNetMesh.csproj"/><Project Path="tests/Tedd.DotNetMesh.Tests/Tedd.DotNetMesh.Tests.csproj"/></Solution>
+<Solution>
+  <Project Path="src/Tedd.DotNetMesh/Tedd.DotNetMesh.csproj"/>
+  <Project Path="src/Tedd.DotNetMesh.ServiceHost/Tedd.DotNetMesh.ServiceHost.csproj"/>
+  <Project Path="tests/Tedd.DotNetMesh.Tests/Tedd.DotNetMesh.Tests.csproj"/>
+</Solution>

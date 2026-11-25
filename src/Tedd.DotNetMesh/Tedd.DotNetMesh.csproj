@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="../../../Tedd.DotNetPod/src/Tedd.DotNetPod/Tedd.DotNetPod.csproj"/>
     <ProjectReference Include="../../../Tedd.HostNetMesh/src/Tedd.HostMesh/Tedd.HostMesh.csproj"/>
+    <ProjectReference Include="../../../Tedd.SMB3/src/Tedd.SMB3/Tedd.SMB3.csproj"/>
     <ProjectReference Include="../../../Tedd.TDFS/src/Tedd.Tdfs.Client/Tedd.Tdfs.Client.csproj"/>
   </ItemGroup>
 </Project>

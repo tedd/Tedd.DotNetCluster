@@ -9,7 +9,7 @@ using Tedd.Tdfs;
 namespace Tedd.DotNetMesh;
 
 public sealed record WorkerOptions(string Node, string Zone, string RuntimeDirectory, int MemoryMiB, int MilliCpu,
-    Dictionary<string, MeshBinding> Bindings, string EngineSocket = "/var/run/docker.sock");
+    Dictionary<string, MeshBinding> Bindings, string EngineSocket = "/var/run/docker.sock", WorkerSmbOptions? Smb = null);
 
 public static class WorkloadNetwork
 {
@@ -19,12 +19,14 @@ public static class WorkloadNetwork
 
 public sealed class Worker : IAsyncDisposable
 {
-    sealed record Active(string Generation, string Root, DfsSnapshotView Snapshot, VolumeMount Application, VolumeMount Data, PodSpec Spec, AllocationSocket? Network);
+    sealed record Active(string Generation, string Root, DfsSnapshotView Snapshot, List<VolumeMount> Mounts, PodSpec Spec,
+        AllocationSocket? Network, bool ShareRegistered = false);
     readonly WorkerOptions config;
     readonly PodHost host;
     readonly DfsVolume volume;
     readonly ControlStore store;
     readonly FileStream owner;
+    readonly WorkerSmbHost? smb;
     readonly ConcurrentDictionary<string, Active> active = new();
     readonly ConcurrentDictionary<string, string> ready = new();
     readonly Dictionary<string, (int Attempts, long Retry)> failures = new();
@@ -41,6 +43,8 @@ public sealed class Worker : IAsyncDisposable
         store = new(volume);
         Directory.CreateDirectory(config.RuntimeDirectory);
         owner = new(Path.Combine(config.RuntimeDirectory, "worker.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        try { if (options.Smb != null) smb = WorkerSmbHost.Start(options.Smb); }
+        catch { owner.Dispose(); throw; }
         lastContact = this.clock.GetTimestamp();
     }
 
@@ -51,17 +55,23 @@ public sealed class Worker : IAsyncDisposable
         foreach (var entry in Directory.EnumerateDirectories(config.RuntimeDirectory, "alloc-*"))
         {
             if (!Guid.TryParseExact(Path.GetFileName(entry)[6..], "N", out _)) continue;
-            File.Delete(Path.Combine(entry, "ipc"));
-            foreach (var leaf in new[] { "app", "data" })
-            {
-                var path = Path.Combine(entry, leaf);
-                if (File.ReadLines("/proc/self/mountinfo").Any(l => l.Split(' ')[4] == EscapeMount(path) &&
-                    l.Contains(" - fuse.dotnetmesh ", StringComparison.Ordinal)))
-                    if (umount2(path, 2) != 0) throw new IOException($"Could not detach {path}.");
-                if (Directory.Exists(path)) Directory.Delete(path);
-            }
-            Directory.Delete(entry);
+            DeleteAllocationDirectory(entry, recover: true);
         }
+    }
+
+    static void DeleteAllocationDirectory(string root, bool recover = false)
+    {
+        File.Delete(Path.Combine(root, "ipc"));
+        foreach (var link in Directory.EnumerateFileSystemEntries(root, "data-*")) File.Delete(link);
+        foreach (var leaf in new[] { "app", "data" })
+        {
+            var path = Path.Combine(root, leaf);
+            if (recover && File.ReadLines("/proc/self/mountinfo").Any(l => l.Split(' ')[4] == EscapeMount(path) &&
+                l.Contains(" - fuse.dotnetmesh ", StringComparison.Ordinal)) && umount2(path, 2) != 0)
+                throw new IOException($"Could not detach {path}.");
+            if (Directory.Exists(path)) Directory.Delete(path);
+        }
+        Directory.Delete(root);
     }
 
     static string EscapeMount(string path) => path.Replace("\\", "\\134").Replace(" ", "\\040").Replace("\t", "\\011").Replace("\n", "\\012");
@@ -82,6 +92,11 @@ public sealed class Worker : IAsyncDisposable
         {
             await foreach (var state in plans.Reader.ReadAllAsync(ct))
             {
+                if (smb?.Completion.IsCompleted == true)
+                {
+                    await smb.Completion;
+                    throw new IOException("The worker SMB listener stopped.");
+                }
                 try { await ApplyAsync(state, ct); }
                 catch (Exception e) when (!ct.IsCancellationRequested)
                 {
@@ -93,9 +108,8 @@ public sealed class Worker : IAsyncDisposable
         {
             await lifetime.CancelAsync();
             try { await heartbeats; } catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
-            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-            try { await HeartbeatAsync(true, deadline.Token); }
-            catch (Exception error) { Console.Error.WriteLine($"Drain announcement: {error.Message}"); }
+            try { await DrainAsync(); }
+            catch (Exception error) { Console.Error.WriteLine($"Worker drain: {error.Message}"); }
         }
 
         async Task ReportLoop()
@@ -114,6 +128,30 @@ public sealed class Worker : IAsyncDisposable
                 }
             }
             finally { plans.Writer.TryComplete(); }
+        }
+    }
+
+    async Task DrainAsync()
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var state = await HeartbeatAsync(true, deadline.Token);
+        using var completed = new CancellationTokenSource();
+        var keepAlive = RenewWhileStopping();
+        try { await ApplyAsync(state, CancellationToken.None); }
+        finally
+        {
+            await completed.CancelAsync();
+            try { await keepAlive; } catch (OperationCanceledException) when (completed.IsCancellationRequested) { }
+        }
+
+        async Task RenewWhileStopping()
+        {
+            while (true)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(2), clock, completed.Token);
+                try { await HeartbeatAsync(true, completed.Token); }
+                catch (Exception e) when (!completed.IsCancellationRequested) { Console.Error.WriteLine($"Drain heartbeat: {e.Message}"); }
+            }
         }
     }
 
@@ -146,7 +184,7 @@ public sealed class Worker : IAsyncDisposable
             var addresses = keys.Where(id => config.Bindings[id].Address != null).ToDictionary(id => id, id => config.Bindings[id].Address!);
             foreach (var pair in failedSlots)
                 if (pair.Value <= clock.GetTimestamp()) failedSlots.TryRemove(pair);
-            s.Nodes[config.Node] = new(config.Node, config.Zone, now, config.MemoryMiB, config.MilliCpu, drain, keys.ToArray(), new(ready), images, addresses, failedSlots.Keys.ToArray());
+            s.Nodes[config.Node] = new(config.Node, config.Zone, now, config.MemoryMiB, config.MilliCpu, drain, keys.ToArray(), new(ready), images, addresses, failedSlots.Keys.ToArray(), SupportsStopHandoff: true);
             Scheduler.Reconcile(s, now);
         }, ct);
         lastContact = clock.GetTimestamp();
@@ -166,13 +204,24 @@ public sealed class Worker : IAsyncDisposable
     {
         var targets = state.Slots.Where(p => p.Value.Node == config.Node).ToDictionary();
         foreach (var (id, local) in active.ToArray())
-            if (!targets.TryGetValue(id, out var target) || target.Generation != local.Generation ||
-                (local.Spec.MeshSocket != null && local.Network?.Expired != false))
+            if (!targets.TryGetValue(id, out var target) || !target.Stopping && (target.Generation != local.Generation ||
+                local.Spec.MeshSocket != null && local.Network?.Expired != false))
                 await RemoveAsync(id, ct);
 
         foreach (var generation in failures.Keys.Except(targets.Values.Select(v => v.Generation)).ToArray()) failures.Remove(generation);
         foreach (var (id, target) in targets)
         {
+            if (target.Stopping)
+            {
+                try
+                {
+                    if (active.ContainsKey(id)) await RemoveAsync(id, ct, 30);
+                    else await host.UnloadAsync(id, 30, ct);
+                    await store.ChangeAsync(s => Scheduler.ConfirmStopped(s, id, config.Node, target.Generation, clock.GetUtcNow()), ct);
+                }
+                catch (Exception error) when (!ct.IsCancellationRequested) { Console.Error.WriteLine($"Stopping {id}: {error.Message}"); }
+                continue;
+            }
             var retry = failures.GetValueOrDefault(target.Generation);
             if (clock.GetTimestamp() < retry.Retry) continue;
             try
@@ -183,6 +232,11 @@ public sealed class Worker : IAsyncDisposable
                     active[id] = local;
                 }
                 var status = await host.EnsureAsync(local.Spec, ct);
+                if (smb != null && !local.ShareRegistered && status.State == "running")
+                {
+                    await smb.AddAsync(id, local.Spec.Data, ct);
+                    active[id] = local with { ShareRegistered = true };
+                }
                 if (target.Release.LivenessFile != null && status.State == "running")
                 {
                     var limit = clock.GetUtcNow().AddSeconds(-target.Release.LivenessTimeoutSeconds);
@@ -217,21 +271,24 @@ public sealed class Worker : IAsyncDisposable
         var id = d.Slot(slot.Ordinal);
         var root = Path.Combine(config.RuntimeDirectory, "alloc-" + slot.Generation);
         var app = Path.Combine(root, "app"); var data = Path.Combine(root, "data");
-        Directory.CreateDirectory(app); Directory.CreateDirectory(data);
+        Directory.CreateDirectory(root);
         DfsSnapshotView? snapshot = null;
-        VolumeMount? appMount = null;
-        VolumeMount? dataMount = null;
+        List<VolumeMount> mounts = [];
         AllocationSocket? network = null;
         try
         {
             snapshot = await volume.Snapshots.OpenAsync(d.Snapshot, ct);
             var appRoot = "/apps/" + d.Name;
-            if (!await snapshot.Files.ExistsAsync(appRoot + "/" + d.EntryPoint, ct)) throw new FileNotFoundException(d.EntryPoint);
-            var dataRoot = "/data/" + d.Name + "/" + slot.Ordinal;
+            await d.ValidateApplicationAsync(snapshot.Files, snapshot.Directories, ct);
+            var dataRoot = d.DataRoot(slot.Ordinal);
+            var mappings = d.PersistentDirectories ?? [];
             var fence = new ReplicaFence(volume, id, slot.Generation);
-            fence.Mutate((_, directories) => directories.CreateDirectory(dataRoot));
-            appMount = new(app, appRoot, snapshot.Files, snapshot.Directories);
-            dataMount = new(data, dataRoot, volume.Files, volume.Directories, fence);
+            fence.Mutate((_, directories) =>
+            {
+                directories.CreateDirectory(dataRoot);
+                foreach (var mapping in mappings) directories.CreateDirectory(VolumeMount.ScopedPath(dataRoot, "/" + mapping.Source));
+                return 0;
+            });
             MeshBinding? binding = null;
             if (d.Mesh)
             {
@@ -241,27 +298,36 @@ public sealed class Worker : IAsyncDisposable
             }
             var spec = d.Template(slot.Ordinal, app, data, binding);
             spec.Validate();
-            return new(slot.Generation, root, snapshot, appMount, dataMount, spec, network);
+            Directory.CreateDirectory(app);
+            Directory.CreateDirectory(data);
+            mounts.Add(new(app, appRoot, snapshot.Files, snapshot.Directories));
+            mounts.Add(new(data, dataRoot, volume.Files, volume.Directories, fence));
+            // Daemon-local links live outside the pod. All aliases bind the same FUSE inode and page cache.
+            for (int i = 0; i < mappings.Length; i++)
+                Directory.CreateSymbolicLink(spec.DirectoryMounts![i].Source, Path.Combine(data, mappings[i].Source));
+            return new(slot.Generation, root, snapshot, mounts, spec, network);
         }
         catch
         {
             if (network != null) await network.DisposeAsync();
-            dataMount?.Dispose(); appMount?.Dispose();
+            foreach (var mount in mounts) mount.Dispose();
             if (snapshot != null) await snapshot.DisposeAsync();
-            Directory.Delete(data); Directory.Delete(app); Directory.Delete(root);
+            DeleteAllocationDirectory(root);
             throw;
         }
     }
 
-    async Task RemoveAsync(string id, CancellationToken ct)
+    async Task RemoveAsync(string id, CancellationToken ct, int graceSeconds = 10)
     {
         ready.TryRemove(id, out _);
         var local = active[id];
+        if (smb != null) await smb.RemoveAsync(id, ct);
+        await host.UnloadAsync(id, graceSeconds, ct);
         if (local.Network != null) await local.Network.DisposeAsync();
         active[id] = local with { Network = null };
-        await host.UnloadAsync(id, ct: ct);
-        local.Data.Dispose(); local.Application.Dispose(); await local.Snapshot.DisposeAsync();
-        Directory.Delete(local.Spec.Data); Directory.Delete(local.Spec.Application); Directory.Delete(local.Root);
+        foreach (var mount in local.Mounts) mount.Dispose();
+        await local.Snapshot.DisposeAsync();
+        DeleteAllocationDirectory(local.Root);
         active.TryRemove(id, out _);
     }
 
@@ -271,6 +337,10 @@ public sealed class Worker : IAsyncDisposable
         {
             foreach (var id in active.Keys.ToArray()) await RemoveAsync(id, CancellationToken.None);
         }
-        finally { owner.Dispose(); }
+        finally
+        {
+            try { if (smb != null) await smb.DisposeAsync(); }
+            finally { owner.Dispose(); }
+        }
     }
 }

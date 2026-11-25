@@ -10,6 +10,40 @@ namespace Tedd.DotNetMesh.Tests;
 public class FailoverTests
 {
     [Fact]
+    public Task OrderedHandoffPreservesFinalWritesAndRevokesTheOldOwnerAtAcknowledgement() =>
+        ClusterTest.RunAsync(TestClusterOptions.SingleNode, async cluster =>
+        {
+            var ct = TestContext.Current.CancellationToken;
+            await using var client = await cluster.ConnectAsync(ct: ct);
+            var volume = client.GetVolume("vol");
+            var store = new ControlStore(volume);
+            var app = SchedulerTests.App with { Replicas = 1 };
+            var next = app with { Image = "sha256:" + new string('b', 64), Snapshot = "next" };
+            var key = app.Slot(0);
+            var now = DateTimeOffset.UtcNow;
+            var state = await store.ChangeAsync(s =>
+            {
+                s.Nodes["a"] = new("a", "east", now, 512, 2000, false, [], new(), [app.Image], SupportsStopHandoff: true);
+                s.Nodes["b"] = new("b", "west", now, 512, 2000, false, [], new(), [next.Image], SupportsStopHandoff: true);
+                s.Deployments[app.Name] = app;
+                Scheduler.Reconcile(s, now);
+            }, ct);
+            var old = state.Slots[key];
+            state = await store.ChangeAsync(s =>
+            {
+                s.Deployments[app.Name] = next;
+                Scheduler.Reconcile(s, now);
+            }, ct);
+            Assert.True(state.Slots[key].Stopping);
+            var outgoing = new ReplicaFence(volume, key, old.Generation);
+            outgoing.Mutate((files, _) => files.WriteAllText("/shutdown-checkpoint", "complete"));
+            state = await store.ChangeAsync(s => Scheduler.ConfirmStopped(s, key, old.Node, old.Generation, now), ct);
+            Assert.Equal("b", state.Slots[key].Node);
+            Assert.Throws<UnauthorizedAccessException>(() => outgoing.Mutate((files, _) => files.WriteAllText("/shutdown-checkpoint", "stale")));
+            Assert.Equal("complete", new ReplicaFence(volume, key, state.Slots[key].Generation).Mutate((files, _) => files.ReadAllText("/shutdown-checkpoint")));
+        }, TestContext.Current.CancellationToken);
+
+    [Fact]
     public Task RelocationRejectsAnInFlightMutationFromTheOldOwner() =>
         ClusterTest.RunAsync(TestClusterOptions.SingleNode, async cluster =>
         {
@@ -42,7 +76,7 @@ public class FailoverTests
             Assert.Equal("new", await volume.Files.ReadAllTextAsync("/new-write", ct: ct));
         }, TestContext.Current.CancellationToken);
 
-    public static bool Live => StorageTests.Live;
+    public static bool Live => StorageTests.ContainerAvailable;
 
     [Fact(SkipUnless = nameof(Live), Skip = "Requires two worker processes, loopback QUIC, FUSE and a disposable Linux engine.")]
     public Task KilledWorkerIsReplacedAndRejoiningWorkerReleasesItsOrphan() =>

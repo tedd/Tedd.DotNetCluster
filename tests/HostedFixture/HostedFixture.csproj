@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><EnableDynamicLoading>true</EnableDynamicLoading></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Tedd.DotNetMesh.ServiceHost/Tedd.DotNetMesh.ServiceHost.csproj"/>
+  </ItemGroup>
+</Project>

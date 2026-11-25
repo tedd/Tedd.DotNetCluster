@@ -1,4 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner></PropertyGroup><ItemGroup>
 <ProjectReference Include="../../src/Tedd.DotNetMesh/Tedd.DotNetMesh.csproj"/>
+<ProjectReference Include="../../src/Tedd.DotNetMesh.ServiceHost/Tedd.DotNetMesh.ServiceHost.csproj"/>
+<ProjectReference Include="../HostedFixture/HostedFixture.csproj"/>
 <ProjectReference Include="../../../Tedd.TDFS/tests/Tedd.Tdfs.Testing/Tedd.Tdfs.Testing.csproj"/>
 <PackageReference Include="xunit.v3" Version="4.0.1"/><Using Include="Xunit"/></ItemGroup></Project>
