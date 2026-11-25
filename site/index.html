@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f7faf9">
+  <title>Tedd.DotNetCluster · .NET service orchestration for Linux</title>
+  <meta name="description" content="Publish .NET services to TDFS, place replicas across Linux workers and retain each replica's data across releases.">
+  <link rel="canonical" href="https://tedd.no/Tedd.DotNetCluster/">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body id="top">
+  <a class="skip" href="#main">Skip to content</a>
+  <header>
+    <div class="wrap nav">
+      <a class="brand" href="#top" aria-label="Tedd.DotNetCluster home"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>TEDD<span class="slash">/</span>DOTNETCLUSTER</a>
+      <nav aria-label="Primary navigation">
+        <a href="#architecture">Architecture</a>
+        <a href="#start">Quick start</a>
+        <a class="source" href="https://github.com/tedd/Tedd.DotNetCluster">GitHub</a>
+      </nav>
+    </div>
+  </header>
+  <main id="main">
+    <div class="hero">
+      <div class="wrap hero-grid">
+        <div>
+          <p class="eyebrow">.NET service orchestration</p>
+          <h1>Run .NET services<br>across <em>Linux workers.</em></h1>
+          <p class="lede">Publish your application to a TDFS snapshot. Workers run the replicas you request and keep each replica’s data with it when it moves.</p>
+          <div class="actions">
+            <a class="button primary" href="#start">Run the sample</a>
+            <a class="button" href="https://github.com/tedd/Tedd.DotNetCluster#readme">Read the guide</a>
+          </div>
+        </div>
+        <figure class="topology">
+          <figcaption><span class="window-dots" aria-hidden="true">● ● ●</span>Example deployment</figcaption>
+          <div class="diagram">
+            <div class="snapshot"><span>Application snapshot</span><code>sample-r1</code></div>
+            <div class="fork" aria-hidden="true"></div>
+            <div class="workers">
+              <div class="worker"><span>Zone east</span><strong>Worker A</strong><code>sample-0</code></div>
+              <div class="worker"><span>Zone west</span><strong>Worker B</strong><code>sample-1</code></div>
+            </div>
+          </div>
+          <p>Both replicas mount the same release at <code>/app</code>. Each has a separate writable <code>/data</code> directory.</p>
+        </figure>
+      </div>
+    </div>
+    <section class="wrap section" id="architecture" aria-labelledby="architecture-title">
+      <p class="eyebrow">Architecture</p>
+      <h2 id="architecture-title">How a release reaches a worker</h2>
+      <div class="cards">
+        <article><code class="path">/app</code><h3>Publish a release</h3><p>The CLI writes the published directory to TDFS and names its snapshot in one transaction. Workers mount that revision read-only.</p></article>
+        <article><code class="path">sample-0</code><h3>Place the replicas</h3><p>Workers report their zone, installed images and capacity. The scheduler spreads replicas across eligible workers and DotNetPod runs each one in a Linux container.</p></article>
+        <article><code class="path">/data</code><h3>Keep the replica’s files</h3><p>Persistent files belong to the deployment name and replica number. When a replacement takes over, TDFS grants its generation write access to those files.</p></article>
+      </div>
+    </section>
+    <section class="start" id="start" aria-labelledby="start-title">
+      <div class="wrap start-grid">
+        <div>
+          <p class="eyebrow">Quick start</p>
+          <h2 id="start-title">Run one replica.</h2>
+          <p>Start with a Linux worker, Docker Engine, FUSE 3 and a TDFS volume. Build the CLI and sample with .NET 11, then set the storage credentials and local runtime image ID in the two configuration files.</p>
+          <a class="guide" href="https://github.com/tedd/Tedd.DotNetCluster#run-the-sample">Build and configure the sample</a>
+        </div>
+        <div class="terminal">
+          <div class="terminal-title">Bash <span>Repository root</span></div>
+          <pre tabindex="0" aria-label="Sample CLI commands"><code><span># With cluster.json and sample.json configured</span>
+mesh() { dotnet ./out/worker/Tedd.DotNetMesh.dll "$@"; }
+
+mesh publish cluster.json sample.json ./out/sample
+mesh apply cluster.json sample.json
+mesh worker cluster.json</code></pre>
+          <p>Keep the worker running. In another terminal, run <code>dotnet ./out/worker/Tedd.DotNetMesh.dll status cluster.json</code> to check placement and readiness.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+  <footer class="wrap"><strong>Tedd.DotNetCluster</strong><div><a href="https://github.com/tedd/Tedd.DotNetCluster/blob/main/SPEC.md">Service specification</a><a href="https://github.com/tedd/Tedd.DotNetCluster/blob/main/LICENSE">Apache-2.0</a></div></footer>
+</body>
+</html>
